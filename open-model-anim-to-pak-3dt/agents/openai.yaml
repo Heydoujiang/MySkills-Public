@@ -1,0 +1,6 @@
+interface:
+  display_name: "Open Model Anim to Pak&3dt"
+  short_description: "从静态零件模型、DCC 动画确认到 UE 蓝图控制与 Pak 或 3dt 交付"
+  default_prompt: "使用 $open-model-anim-to-pak-3dt 为我的模型制作拆解动画，先交付 DCC 预览确认，再配置 UE 控制与碰撞并按指定格式打包。"
+policy:
+  allow_implicit_invocation: true

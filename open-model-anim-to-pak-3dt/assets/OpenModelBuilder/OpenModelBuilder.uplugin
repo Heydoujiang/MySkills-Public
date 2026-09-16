@@ -1,0 +1,1 @@
+{"FileVersion":3,"Version":1,"VersionName":"1.0","FriendlyName":"OpenModel Asset Builder","Description":"Editor-only, reproducible pure Blueprint assembly demo asset generator.","Category":"Editor","CanContainContent":false,"EnabledByDefault":true,"Modules":[{"Name":"OpenModelBuilder","Type":"Editor","LoadingPhase":"Default"}]}
