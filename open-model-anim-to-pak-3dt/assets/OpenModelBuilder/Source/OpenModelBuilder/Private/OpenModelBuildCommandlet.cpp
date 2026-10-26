@@ -1,4 +1,5 @@
 #include "OpenModelBuildCommandlet.h"
+#include "OpenModelAssetContext.h"
 #include "K2Node_InputKey.h"
 #include "EngineUtils.h"
 #include "AssetToolsModule.h"
@@ -27,6 +28,7 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Animation/AnimSequence.h"
+#include "Animation/Skeleton.h"
 #include "Animation/AnimBoneCompressionSettings.h"
 #include "Animation/AnimCompress_BitwiseCompressOnly.h"
 #include "Animation/AnimSingleNodeInstance.h"
@@ -69,7 +71,7 @@ namespace OpenModelBuild
 {
 static const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
 static int32 LayoutIndex = 0;
-static FString ContentRoot = TEXT("/Game/OpenModel");
+static FString ContentRoot = *OpenModelLiteral(TEXT("/Game/OpenModel"));
 static FEdGraphPinType Type(FName Category, UObject* Object=nullptr) { FEdGraphPinType T; T.PinCategory=Category; T.PinSubCategoryObject=Object; return T; }
 static FEdGraphPinType FloatT() { return Type(UEdGraphSchema_K2::PC_Float); }
 static FEdGraphPinType BoolT() { return Type(UEdGraphSchema_K2::PC_Boolean); }
@@ -99,7 +101,7 @@ static void AddVar(UBlueprint* BP,FName Name,FEdGraphPinType T,FString Default=T
 static UBlueprint* MakeAssembly(USkeletalMesh* Mesh,UAnimSequence* Anim)
 {
     auto* BP=NewBP(TEXT("BP_ExplodedAssembly"),AActor::StaticClass());
-    AddVar(BP,TEXT("Progress"),FloatT(),TEXT("0")); AddVar(BP,TEXT("TargetProgress"),FloatT(),TEXT("0")); AddVar(BP,TEXT("bAutoPlaying"),BoolT(),TEXT("false")); AddVar(BP,TEXT("FullTravelDuration"),FloatT(),TEXT("3")); AddVar(BP,TEXT("ExplosionAnimation"),ObjectT(UAnimSequence::StaticClass()),Anim->GetPathName());
+    AddVar(BP,TEXT("Progress"),FloatT(),TEXT("0")); AddVar(BP,TEXT("TargetProgress"),FloatT(),TEXT("0")); AddVar(BP,TEXT("bAutoPlaying"),BoolT(),TEXT("false")); AddVar(BP,TEXT("FullTravelDuration"),FloatT(),FString::SanitizeFloat(Anim->SequenceLength)); AddVar(BP,TEXT("ExplosionAnimation"),ObjectT(UAnimSequence::StaticClass()),Anim->GetPathName());
     auto* SCS=BP->SimpleConstructionScript; auto* Root=SCS->CreateNode(USceneComponent::StaticClass(),TEXT("AssemblyRoot")); SCS->AddNode(Root); auto* Part=SCS->CreateNode(USkeletalMeshComponent::StaticClass(),TEXT("AssemblyMesh")); Root->AddChildNode(Part); auto* Comp=CastChecked<USkeletalMeshComponent>(Part->ComponentTemplate); Comp->SetSkeletalMesh(Mesh); Comp->SetAnimationMode(EAnimationMode::AnimationSingleNode); Comp->AnimationData.AnimToPlay=Anim; Comp->AnimationData.bSavedPlaying=false; Comp->AnimationData.bSavedLooping=false; Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision); Comp->SetBoundsScale(6.f); Comp->VisibilityBasedAnimTickOption=EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones; Comp->bComponentUseFixedSkelBounds=false;
     auto Apply=Func(BP,TEXT("ApplyProgress"),true); auto Manual=Func(BP,TEXT("SetProgress"),true); auto Toggle=Func(BP,TEXT("ToggleAssembly")); Compile(BP);
     {
@@ -178,6 +180,8 @@ int32 UOpenModelBuildCommandlet::Main(const FString& Params)
         UI->bImportAsSkeletal=true; UI->MeshTypeToImport=FBXIT_SkeletalMesh; UI->OriginalImportType=FBXIT_SkeletalMesh;
         UI->bAutomatedImportShouldDetectType=false; UI->bImportAnimations=false;
         UI->bImportMaterials=true; UI->bImportTextures=true; UI->bCreatePhysicsAsset=false;
+        FString SharedSkeleton;FParse::Value(*Params,TEXT("SharedSkeleton="),SharedSkeleton);
+        if(!SharedSkeleton.IsEmpty()){UI->Skeleton=LoadObject<USkeleton>(nullptr,*SharedSkeleton);check(UI->Skeleton);}
         UI->SkeletalMeshImportData->bConvertScene=true; UI->SkeletalMeshImportData->bConvertSceneUnit=true;
         UI->SkeletalMeshImportData->NormalImportMethod=FBXNIM_ImportNormalsAndTangents;
         UI->AnimSequenceImportData->bUseDefaultSampleRate=false; UI->AnimSequenceImportData->CustomSampleRate=30;
@@ -189,6 +193,10 @@ int32 UOpenModelBuildCommandlet::Main(const FString& Params)
         for (UObject* Asset : Created) Save(Asset);
     }
     auto* Mesh=LoadObject<USkeletalMesh>(nullptr,*(ModelPath+TEXT("/")+MeshName+TEXT(".")+MeshName));
+    if(FParse::Param(*Params,TEXT("MeshOnly")))
+    {
+        check(Mesh);UE_LOG(LogTemp,Display,TEXT("OPENMODEL_PARTITION_IMPORTED %s Bones=%d"),*Mesh->GetPathName(),Mesh->RefSkeleton.GetNum());return 0;
+    }
     if (Mesh && !FParse::Param(*Params,TEXT("SkipImport")))
     {
         auto* Task=NewObject<UAssetImportTask>(); Task->Filename=Fbx;
@@ -229,11 +237,31 @@ int32 UOpenModelBuildCommandlet::Main(const FString& Params)
     Save(Anim);
     if (!FParse::Param(*Params,TEXT("ImportOnly")))
     {
-        auto* Assembly=MakeAssembly(Mesh,Anim); auto* Widget=MakeWidget(Assembly);
+        auto* Assembly=MakeAssembly(Mesh,Anim);
+        FString PartitionFile;FParse::Value(*Params,TEXT("PartitionManifest="),PartitionFile);
+        if(!PartitionFile.IsEmpty())
+        {
+            FString Text;TSharedPtr<FJsonObject> Manifest;
+            check(FFileHelper::LoadFileToString(Text,*PartitionFile));check(FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text),Manifest));
+            const auto Groups=Manifest->GetArrayField(TEXT("groups"));
+            for(int32 I=1;I<Groups.Num();++I)
+            {
+                auto Group=Groups[I]->AsObject();const FString Asset=Group->GetStringField(TEXT("assetName"));
+                auto* Extra=LoadObject<USkeletalMesh>(nullptr,*(ModelPath+TEXT("/")+Asset+TEXT(".")+Asset));check(Extra && Extra->Skeleton==Mesh->Skeleton);
+                auto* SCS=Assembly->SimpleConstructionScript;auto* Node=SCS->CreateNode(USkeletalMeshComponent::StaticClass(),*Group->GetStringField(TEXT("componentName")));
+                SCS->GetRootNodes()[0]->AddChildNode(Node);auto* C=CastChecked<USkeletalMeshComponent>(Node->ComponentTemplate);
+                C->SetSkeletalMesh(Extra);C->SetAnimationMode(EAnimationMode::AnimationSingleNode);C->AnimationData.AnimToPlay=Anim;
+                C->AnimationData.bSavedPlaying=false;C->AnimationData.bSavedLooping=false;C->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+                C->SetBoundsScale(6.f);C->VisibilityBasedAnimTickOption=EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;C->bComponentUseFixedSkelBounds=false;
+            }
+            Compile(Assembly);Save(Assembly);UE_LOG(LogTemp,Display,TEXT("PARTITION_COMPONENTS_CREATED %d"),Groups.Num());
+        }
+        auto* Widget=MakeWidget(Assembly);
         auto* Host=MakeUIHost(Widget); MakeMap(Assembly,Host,Mesh);
     }
     UE_LOG(LogTemp,Display,TEXT("OPENMODEL_BUILD_OK Mesh=%s Animation=%s Duration=%g Bones=%d"),*Mesh->GetPathName(),*Anim->GetPathName(),Anim->SequenceLength,Mesh->RefSkeleton.GetNum());
     return 0;
 }
+#include "OpenModelCollection.inl"
 #include "OpenModelPackage.inl"
 #include "OpenModelNoUMG.inl"

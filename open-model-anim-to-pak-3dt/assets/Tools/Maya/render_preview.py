@@ -1,3 +1,4 @@
+# FALLBACK ONLY: prefer native_playblast.py in the authoring DCC. Use offline rendering only when native capture is unavailable or explicitly requested.
 """Blender background utility: fixed-camera assembled/exploded review images.
 
 blender --background --factory-startup --python render_preview.py -- <output-dir> <asset-name>

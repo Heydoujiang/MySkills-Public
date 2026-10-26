@@ -7,6 +7,8 @@
 | 字段 | 含义 |
 |---|---|
 | objectId / hotkey | 如 Gun / N；objectId 用 ASCII 资产标识，hotkey 为 UE EKeys 名称 |
+| assetRoot | 可选制作根目录，默认 `/Game/<objectId>`；验证时工具自动切到蓝图所在目录 |
+| dcc / dccExecutable | 可选用户指定软件和可执行程序；未指定按 Maya → 3ds Max → Blender → 其他检测 |
 | project | 独立工作工程 `.uproject`，生产源工程先复制并备份，不能直接在唯一源工程执行迁移重命名 |
 | engine / customEngine | UE4.26 编辑引擎根目录 / 指定的交付自定义引擎根目录，均含 Engine 子目录 |
 | targetProject | 本次预设工程 `.uproject`，保留其插件和配置 |
@@ -18,21 +20,26 @@
 | format | 用户明确选择的 `pak` 或 `3dt`；缺失时脚本拒绝打包 |
 | profileFile / profileName | 找到的 `.ulp2` 文件和名称，默认名称 New Profile 0 |
 | blueprintFile / validatedBlueprintSha256 | 已通过控制与碰撞验证的磁盘 BP 文件及 SHA256；变更后重新验证和记录 |
+| blueprintAsset / pieMap | PIE 所测蓝图的完整 UE 对象路径与测试关卡；分类迁移后同步改为新路径，不能只更新磁盘文件名 |
+| validationReport / pieReport | 可选覆盖默认报告位置；PIE 通过记录需关联当前蓝图 SHA256 |
+| migrationReport / collectionManifest | 可选迁移报告路径、集合 Actor 蓝图路径覆盖清单；不要混淆 objects 配置文件列表与集合关卡清单 |
 | requiredPakPaths | 从本次 migration.json 推导全部必需的包内路径，不只列主蓝图 |
 | forbiddenPakPaths | 上一分支不应出现的模型路径，不把预设正常引擎资源误判为残留 |
+| partitionManifest | 可选分组 FBX 清单；必须验证来源、每组文件哈希和几何覆盖，见 large-models.md |
+| objects | 集合配置中的单物件配置文件列表，路径相对集合配置文件；每件必须有独立批准与验收记录 |
 
 `importOnly` 和 `rebuildControls` 默认 false。仅在明确重导动画或明确重建控制副本时设置。已有用户修改须先审查备份，不能自动翻转开关绕过已有资产检查。
 
 ## 生产顺序
 
-1. `discover`；用 Maya 后端检查、制作和预览。`check-approval CONFIG` 只验证真实确认，不生成确认。
-2. 将工作工程放在独立目录，先备份。`materialize CONFIG` 将 editor-only 插件模板复制到工作工程并替换 objectId/按键；有同名插件时拒绝覆盖，需要先比对与备份。
+1. `discover` 列出软件候选；`verify-dcc CONFIG` 检查指定/优先候选的后台启动。再验证该 DCC 的 FBX 导入导出和原生拍屏。`check-approval CONFIG` 只验证真实确认，不生成确认。
+2. 将 UE 工作工程放在独立目录，先备份。`materialize CONFIG` 一次复制通用 editor-only 插件模板；objectId/按键使用运行参数，不再为每件替换源码。有同名插件时拒绝覆盖，需要先比对与备份。
 3. `ue-build-plugin CONFIG` 编译（本模板针对 Windows、UE4.26、VS2019；其他工具链需实机适配）。`ue-import CONFIG` 导入获批 FBX。
 4. `ue-controls CONFIG` 生成最终两函数无 UMG 蓝图，`ue-free-camera CONFIG` 输出自由视角演示地图，`ue-collision CONFIG` 检查/添加运动盒体，`ue-validate CONFIG` 检查姿态和交互。
-5. 阅读源码中的 `OpenModelNoUMGTest.cpp`，在该工作工程运行后台 PIE 自动化测试 `OpenModel.NoUMG.PIE`，报告输出目录单独指定。materialize 已替换模型包路径和实际按键；测试名称保留固定名称，不是模型依赖。首次着色器编译可能占用时间，要区分准备时间和运行超时。
-6. .pak 迁移前，在工作工程创建与目标同名的 JC_CustomAssets 内容插件挂载点，只复制 `.uplugin` 描述并创建空 Content；不要将目标整个库复制进工作副本。检测目标重名资产并处理，再运行 `ue-prepare CONFIG`。该命令会重命名工作副本的资产；之后使用 `ue-validate-relocated CONFIG`，不要继续按旧包路径验证。与原工作资产不同的磁盘位置要更新 blueprintFile/hash 记录。
-7. .3dt 用 `ue-prepare CONFIG` 只清理工作副本中的 FreeView 关卡、复制依赖，保留蓝图文件内容。确认目标 BP 哈希与已验证版本一致、地图一个业务 Actor 且位置归零。
-8. 从迁移清单构造 requiredPakPaths：.3dt 前缀 `<ProjectName>/Content/`；.pak 前缀 `<ProjectName>/Plugins/JC_CustomAssets/Content/`。逐个核对目标资产存在并哈希一致，检查无旧源路径依赖；报告应包含碰撞检查。
+5. `ue-pie CONFIG` 在工作工程执行后台自动化测试 `OpenModel.NoUMG.PIE`，传入本次模型/蓝图路径和实际按键。每次运行使用新的 `PIE/runs/<时间_UUID>/` 保存 index/log/截图，旧 passed 归档并失效。只有本次指定测试成功才写入 `PIE/passed.json`（或 pieReport），绑定运行目录、报告哈希、蓝图哈希、按键和地图。首次着色器编译可能占用时间，要区分准备时间和运行超时；不能复用旧 index 冒充新测试。
+6. .pak 迁移前，在工作工程创建与目标同名的 JC_CustomAssets 内容插件挂载点，只复制 `.uplugin` 描述并创建空 Content；不要将目标整个库复制进工作副本。检测目标重名资产并处理，再运行 `ue-prepare CONFIG`。该命令会重命名工作副本的资产；之后使用 `ue-validate-relocated CONFIG`，更新 `blueprintFile`、`blueprintAsset` 和 hash，再以新蓝图完成 `ue-pie`。不要拿旧路径的验证记录替代。
+7. .3dt 用 `ue-prepare CONFIG` 只清理工作副本中的 FreeView 关卡、复制依赖，保留蓝图文件内容。单模型检查一个业务 Actor 且默认位置归零；多模型按集合配置生成所需 Actor，并依完整运动包络排布。确认目标 BP 哈希与已验证版本一致。
+8. 工具从 `migration.json` 推导必需资产并合并显式 `requiredPakPaths`。普通 .3dt 项目资源前缀 `<ProjectName>/Content/`；插件资源前缀 `<ProjectName>/Plugins/JC_CustomAssets/Content/`；集合 .3dt 可以同时包含二者。逐个核对来源/目标文件哈希一致及无旧源路径依赖。
 9. `package CONFIG` 检查确认、碰撞记录、蓝图哈希，备份并设置 profile，在后台启动 AutomationTool；`verify CONFIG` 检查成功和新输出，执行 UnrealPak Verify/List，核对清单并按分支改名或保留。
 
 命令行例子：`python scripts/workflow.py ue-collision task.json`。脚本不会自动安装 DCC、引擎、构建依赖或启用安全权限；缺少环境时先报告缺口。
@@ -41,9 +48,44 @@
 
 - `ue-import` 的历史内部工厂先产生基础装配 BP/演示模板，`ue-controls` 生成最终 NoUMG 两函数资产并移除固定摄像机。只迁移最终关卡或最终蓝图闭包；内部 UMG 模板不是交付物，也不应暴露为最终演示。
 - `OpenModelUserVariable.inl` 仅用于已有旧蓝图的一次性升级。新工厂直接产生两个函数，不再调用 SplitUserVariable。
-- materialize 当前参数化名称、资源路径和按键；更换接口名称、资产类别或层级组织需要修改模板并重新验证。
+- 模板运行时参数化名称、资源路径和按键；更换接口名称、资产类别或层级组织需要修改模板并重新验证。
 - PhysicsAsset 等额外模型依赖需纳入分类；未知依赖会停止，避免静默漏包。多个逻辑零件不独立时不能直接套用刚性绑定后端。
-- 装配体模板默认一个 SkeletalMesh。额外可视组件或多个动画网格需要扩展碰撞取样与依赖验证，不能仅包围第一个网格后宣称覆盖全部物体。
+- 装配体默认一个 SkeletalMesh，大模型可按分组清单生成多个内部骨骼网格，使用同一进度。全部组件必须纳入取样、碰撞和打包依赖；其他类型可视组件需检查适配范围。
 - `.pak` 后续单独复用前需要宿主加载器验证。两个打包分支生成成功不代表任意 UE4.26 构建都兼容，必须使用目标指定自定义引擎。
 
 正式入口为 workflow.py；早期试跑的 UE 包装脚本不随 Skill 分发。不要恢复历史跳过预览的参数。修改脚本时保持真实审批、版本核验、后台执行和失败退出。
+
+## Maya 工具入口
+
+以下工具使用本地 Maya 的 mayapy；参数是当前任务路径，不把示例字符串当真实路径。
+
+```text
+explode_pipeline.py inspect SOURCE --output INSPECTION.json
+explode_pipeline.py create-config SOURCE --name OBJECT_ID --output MOTION.json --duration-seconds 5.5
+explode_pipeline.py build MOTION.json --output GENERATED_DIRECTORY
+explode_pipeline.py update MOTION.json --scene ORIGINAL_WORK_SCENE.mb --output GENERATED_DIRECTORY
+explode_pipeline.py export MOTION.json --scene ORIGINAL_WORK_SCENE.mb --output NEW_EXPORT_DIRECTORY
+native_playblast.py ORIGINAL_WORK_SCENE.mb --output PREVIEW.avi --camera REVIEW_CAMERA
+```
+
+`build` 是首次建工程；`update` 才是修订入口，自动备份当前文件与上次已应用配置后在同一路径保存。现有工程缺少该模板的骨骼/静态姿态元数据时，先检查适配，不从静态源重建冒充原工程修改。`export` 用最新工程输出动画，不覆盖主工程。`--duration-seconds` 示例可按实际节奏调整。
+
+拍屏默认沿用工程已有相机；首次需要自动取景可用 `--fit`，修订不要无故换角度。可用 `--start/--end/--width/--height` 明确预览范围与尺寸；脚本从配套配置/验证文件确定动画范围，不依赖禁用脚本节点后可能重置的 Maya 时间条。先用小样例验证本机离屏拍屏能力。
+
+对过大的原生 AVI，使用普通 Python：
+
+```text
+compress_playblast.py PREVIEW.avi --ffmpeg FFMPEG_EXECUTABLE --encoder auto --verify-quality
+```
+
+支持 `auto|nvenc|cpu`；auto 尝试硬件编码并在不支持时回退 CPU。默认只压缩超过 50 MiB 的 AVI，较小的原生视频直接交付；用 `--min-size-mb` 按需求调整。转换保留源视频；完整解码核对帧数、尺寸、帧率，`--verify-quality` 进一步比较画面。已有输出使用 `--verify-existing` 检查，不能无提示覆盖。`review_native_playblast.py AVI --output DIRECTORY` 可读取未压缩 RGB AVI 并生成辅助检查记录，需要 Pillow；压缩视频直接检查视频，不能交给这个原始帧读取器。
+
+## 集合配置与构建证据
+
+集合 JSON 的 `objects` 是单模型配置文件路径列表，路径相对该集合 JSON；单模型中所有本地文件路径也相对各自配置文件。共享 `project/engine/customEngine/targetProject/format` 必须一致，各模型 `reports`、确认记录与蓝图哈希独立。两种分支使用不同集合配置及报告目录。集合迁移细节见 [multi-model.md](multi-model.md)。
+
+`package` 前逐模型核对确认、碰撞、姿态验证、实际 PIE 和蓝图版本，再核对迁移文件。记录输入快照；`verify` 会拒绝构建过程中发生变化的输入。当前随附碰撞验收器使用 Visibility trace；若用户指定完全不同的碰撞用途，应适配并实测验收通道，不能伪造通过字段。Cooked 负载检查针对本次 UE4.26 分离导出格式；其它合法预设若内联负载，需基于实际 cook 清单适配校验，不直接移除依赖检查。
+
+V0.1 的碰撞报告要求 `passed`、`fullMotionBoundsCovered`、`visibilityTracePassed` 为 true；旧版只记录 `existingCollision` 的报告需重跑 `ue-collision`，不能手填新字段。按任务实际用途保留已有物理设置；检测器无法验证的碰撞类型应报告缺口并适配验收。
+
+旧版没有独立运行目录/测试身份记录的 PIE 通过文件同样需要重新执行 `ue-pie`。验证、PIE 和迁移报告路径覆盖分别使用 validationReport、pieReport、migrationReport，生成与打包读取须保持同一位置。

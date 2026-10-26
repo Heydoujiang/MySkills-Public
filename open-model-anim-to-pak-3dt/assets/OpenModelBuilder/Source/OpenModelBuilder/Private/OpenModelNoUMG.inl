@@ -1,3 +1,4 @@
+#include "OpenModelAssetContext.h"
 // Included in the builder translation unit to reuse editor graph-authoring helpers.
 #include "OpenModelUserVariable.inl"
 #include "OpenModelPakBranch.inl"
@@ -20,9 +21,9 @@ static int32 RemoveFixedCamera(UWorld* World)
 }
 static UBlueprint* MakeNoUMG(bool Rebuild)
 {
-    const FString Folder=TEXT("/Game/OpenModel/NoUMG");
+    const FString Folder=*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG"));
     const FString Name=TEXT("BP_ExplodedAssembly_NoUMG");
-    auto* Source=LoadObject<UBlueprint>(nullptr,TEXT("/Game/OpenModel/BP_ExplodedAssembly.BP_ExplodedAssembly"));
+    auto* Source=LoadObject<UBlueprint>(nullptr,*OpenModelLiteral(TEXT("/Game/OpenModel/BP_ExplodedAssembly.BP_ExplodedAssembly")));
     check(Source && Source->ParentClass==AActor::StaticClass());
     const bool Exists=FPackageName::DoesPackageExist(Folder+TEXT("/")+Name);
     checkf(!Exists || Rebuild,TEXT("NoUMG asset already exists; pass -Rebuild only to intentionally replace its control graphs"));
@@ -61,13 +62,21 @@ static UBlueprint* MakeNoUMG(bool Rebuild)
     Compile(BP);
     auto* G=F.Graph;
     auto Input=[&](FName N){return P(F.Entry,N);};
-    auto MeshCall=[&](FName N){auto* C=Call(G,USkeletalMeshComponent::StaticClass(),N); Wire(Val(G,TEXT("AssemblyMesh")),P(C,UEdGraphSchema_K2::PN_Self)); return C;};
+    TArray<FName> MeshNames;
+    for(auto* Node:BP->SimpleConstructionScript->GetAllNodes())if(Node->ComponentTemplate->IsA<USkeletalMeshComponent>())MeshNames.Add(Node->GetVariableName());
+    check(MeshNames.Num());
+    auto MeshCall=[&](FName N,FName Component){auto* C=Call(G,USkeletalMeshComponent::StaticClass(),N); Wire(Val(G,Component),P(C,UEdGraphSchema_K2::PN_Self)); return C;};
     auto Note=[](UEdGraphNode* N,const TCHAR* Text){N->NodeComment=Text; N->bCommentBubbleVisible=true;};
     auto* Init=Branch(G,Val(G,TEXT("bInitialized"))); Exec(F.Entry,Init); Note(Init,TEXT("1. Initialize once; all runtime logic stays in this function"));
-    auto* Mode=MeshCall(TEXT("SetAnimationMode")); Def(Mode,TEXT("InAnimationMode"),TEXT("AnimationSingleNode")); Exec(Init,Mode,UEdGraphSchema_K2::PN_Else);
-    auto* Animation=MeshCall(TEXT("SetAnimation")); Wire(Val(G,TEXT("ExplosionAnimation")),P(Animation,TEXT("NewAnimToPlay"))); Exec(Mode,Animation);
-    auto* Stop=MeshCall(TEXT("Stop")); Exec(Animation,Stop);
-    auto* Initialized=Set(G,TEXT("bInitialized")); Def(Initialized,TEXT("bInitialized"),TEXT("true")); Exec(Stop,Initialized);
+    UEdGraphNode* InitTail=Init;
+    for(FName Component:MeshNames)
+    {
+        auto* Mode=MeshCall(TEXT("SetAnimationMode"),Component);Def(Mode,TEXT("InAnimationMode"),TEXT("AnimationSingleNode"));
+        Exec(InitTail,Mode,InitTail==Init?UEdGraphSchema_K2::PN_Else:UEdGraphSchema_K2::PN_Then);
+        auto* Animation=MeshCall(TEXT("SetAnimation"),Component);Wire(Val(G,TEXT("ExplosionAnimation")),P(Animation,TEXT("NewAnimToPlay")));Exec(Mode,Animation);
+        auto* Stop=MeshCall(TEXT("Stop"),Component);Exec(Animation,Stop);InitTail=Stop;
+    }
+    auto* Initialized=Set(G,TEXT("bInitialized")); Def(Initialized,TEXT("bInitialized"),TEXT("true")); Exec(InitTail,Initialized);
 
 
 
@@ -77,7 +86,7 @@ static UBlueprint* MakeNoUMG(bool Rebuild)
     auto* Clamp=Math(G,TEXT("FClamp")); Wire(Val(G,TEXT("Progress")),P(Clamp,TEXT("Value"))); Def(Clamp,TEXT("Min"),TEXT("0")); Def(Clamp,TEXT("Max"),TEXT("1"));
     auto* Clamped=Set(G,TEXT("Progress")); Wire(Out(Clamp),P(Clamped,TEXT("Progress"))); Exec(Manual,Clamped); Exec(Edit,Clamped,UEdGraphSchema_K2::PN_Else);
 
-    auto* Toggle=Branch(G,Input(TEXT("Toggle"))); Exec(Clamped,Toggle); Note(Toggle,TEXT("3. N / Toggle: reverse moving target; manual middle resumes outward"));
+    auto* Toggle=Branch(G,Input(TEXT("Toggle"))); Exec(Clamped,Toggle); Note(Toggle,TEXT("3. Hotkey / Toggle: reverse moving target; manual middle resumes outward"));
     auto* Moving=Branch(G,Val(G,TEXT("bAutoPlaying"))); Exec(Toggle,Moving);
     auto* Reverse=Math(G,TEXT("Subtract_FloatFloat")); Def(Reverse,TEXT("A"),TEXT("1")); Wire(Val(G,TEXT("TargetProgress")),P(Reverse,TEXT("B")));
     auto* Reversed=Set(G,TEXT("TargetProgress")); Wire(Out(Reverse),P(Reversed,TEXT("TargetProgress"))); Exec(Moving,Reversed);
@@ -95,8 +104,12 @@ static UBlueprint* MakeNoUMG(bool Rebuild)
 
     auto* Len=Call(G,UAnimSequenceBase::StaticClass(),TEXT("GetPlayLength")); Wire(Val(G,TEXT("ExplosionAnimation")),P(Len,UEdGraphSchema_K2::PN_Self)); Exec(Next,Len); Exec(Advance,Len,UEdGraphSchema_K2::PN_Else); Note(Len,TEXT("5. Absolute animation sampling and remembered applied progress"));
     auto* Time=Math(G,TEXT("Multiply_FloatFloat")); Wire(Val(G,TEXT("Progress")),P(Time,TEXT("A"))); Wire(Out(Len),P(Time,TEXT("B")));
-    auto* Position=MeshCall(TEXT("SetPosition")); Wire(Out(Time),P(Position,TEXT("InPos"))); Def(Position,TEXT("bFireNotifies"),TEXT("false")); Exec(Len,Position);
-    auto* Last=Set(G,TEXT("LastAppliedProgress")); Wire(Val(G,TEXT("Progress")),P(Last,TEXT("LastAppliedProgress"))); Exec(Position,Last);
+    UEdGraphNode* PoseTail=Len;
+    for(FName Component:MeshNames)
+    {
+        auto* Position=MeshCall(TEXT("SetPosition"),Component);Wire(Out(Time),P(Position,TEXT("InPos")));Def(Position,TEXT("bFireNotifies"),TEXT("false"));Exec(PoseTail,Position);PoseTail=Position;
+    }
+    auto* Last=Set(G,TEXT("LastAppliedProgress")); Wire(Val(G,TEXT("Progress")),P(Last,TEXT("LastAppliedProgress"))); Exec(PoseTail,Last);
     auto* Different=Math(G,TEXT("NotEqual_FloatFloat")); Wire(Val(G,TEXT("Progress")),P(Different,TEXT("A"))); Wire(Val(G,TEXT("TargetProgress")),P(Different,TEXT("B")));
     auto* KeepPlaying=Math(G,TEXT("BooleanAND")); Wire(Val(G,TEXT("bAutoPlaying")),P(KeepPlaying,TEXT("A"))); Wire(Out(Different),P(KeepPlaying,TEXT("B")));
     auto* Active=Set(G,TEXT("bAutoPlaying")); Wire(Out(KeepPlaying),P(Active,TEXT("bAutoPlaying"))); Exec(Last,Active); Exec(Active,F.Result);
@@ -115,7 +128,7 @@ static UBlueprint* MakeNoUMG(bool Rebuild)
     auto* Events=EventGraph(BP); LayoutIndex=0;
     auto* Begin=Event(Events,AActor::StaticClass(),TEXT("ReceiveBeginPlay")); auto* BeginCall=Call(Events,BP->GeneratedClass,TEXT("ControlAssembly")); Exec(Begin,BeginCall);
     auto* Tick=Event(Events,AActor::StaticClass(),TEXT("ReceiveTick")); auto* TickCall=Call(Events,BP->GeneratedClass,TEXT("ControlAssembly")); Wire(P(Tick,TEXT("DeltaSeconds")),P(TickCall,TEXT("DeltaSeconds"))); Exec(Tick,TickCall);
-    auto* Key=NewNode<UK2Node_InputKey>(Events); Key->InputKey=EKeys::N; Key->bConsumeInput=true; Key->AllocateDefaultPins();
+    auto* Key=NewNode<UK2Node_InputKey>(Events); Key->InputKey=OpenModelHotkey(); Key->bConsumeInput=false; Key->AllocateDefaultPins();
     auto* KeyCall=Call(Events,BP->GeneratedClass,TEXT("ControlAssembly")); Def(KeyCall,TEXT("Toggle"),TEXT("true")); Wire(Key->GetPressedPin(),P(KeyCall,UEdGraphSchema_K2::PN_Execute));
     Begin->NodePosX=0; Begin->NodePosY=0; BeginCall->NodePosX=350; BeginCall->NodePosY=0;
     Tick->NodePosX=0; Tick->NodePosY=300; TickCall->NodePosX=350; TickCall->NodePosY=300;
@@ -132,16 +145,18 @@ static UBlueprint* MakeNoUMG(bool Rebuild)
 UOpenModelNoUMGCommandlet::UOpenModelNoUMGCommandlet(){IsClient=false; IsEditor=true; IsServer=false; LogToConsole=true;}
 int32 UOpenModelNoUMGCommandlet::Main(const FString& Params)
 {
+    if(FParse::Param(*Params,TEXT("FixInputDefaults")))return OpenModelBuild::FixInputDefaults(Params);
+    if(FParse::Param(*Params,TEXT("PrepareCollectionPackage")))return OpenModelBuild::PrepareCollectionPackage(Params);
     if(FParse::Param(*Params,TEXT("EnsureCollision")))return OpenModelBuild::EnsureMotionCollision(Params);
     if(FParse::Param(*Params,TEXT("PreparePakBranch")))return OpenModelBuild::PreparePakBranch(Params);
     if(FParse::Param(*Params,TEXT("SplitUserVariable")))return OpenModelBuild::SplitUserVariable();
     if(FParse::Param(*Params,TEXT("PreparePackage")))return OpenModelBuild::PreparePackage(Params);
     if(FParse::Param(*Params,TEXT("FreeCamera")))
     {
-        check(FEditorFileUtils::LoadMap(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG"),false,true));
+        check(FEditorFileUtils::LoadMap(*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG")),false,true));
         auto* World=GEditor->GetEditorWorldContext().World();
         int32 Removed=OpenModelBuild::RemoveFixedCamera(World);
-        FString OutputMap=TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG");
+        FString OutputMap=*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG"));
         FParse::Value(*Params,TEXT("OutputMap="),OutputMap);
         check(FPackageName::IsValidLongPackageName(OutputMap));
         const FString Map=FPackageName::LongPackageNameToFilename(OutputMap,FPackageName::GetMapPackageExtension());
@@ -152,7 +167,7 @@ int32 UOpenModelNoUMGCommandlet::Main(const FString& Params)
         return 0;
     }
     auto* BP=OpenModelBuild::MakeNoUMG(FParse::Param(*Params,TEXT("Rebuild")));
-    check(FEditorFileUtils::LoadMap(TEXT("/Game/OpenModel/Demo_ExplodedAssembly"),false,true));
+    check(FEditorFileUtils::LoadMap(*OpenModelLiteral(TEXT("/Game/OpenModel/Demo_ExplodedAssembly")),false,true));
     auto* World=GEditor->GetEditorWorldContext().World();
     TArray<AActor*> Remove;
     FTransform Transform=FTransform::Identity;
@@ -163,10 +178,10 @@ int32 UOpenModelNoUMGCommandlet::Main(const FString& Params)
         if(Class==TEXT("BP_AssemblyUIHost_C"))Remove.Add(*It);
     }
     for(auto* Actor:Remove)World->DestroyActor(Actor);
-    auto* Actor=World->SpawnActor<AActor>(BP->GeneratedClass,Transform); Actor->SetActorLabel(TEXT("Exploded Assembly - N Key and Progress"));
+    auto* Actor=World->SpawnActor<AActor>(BP->GeneratedClass,Transform); Actor->AutoReceiveInput=EAutoReceiveInput::Player0; Actor->SetActorLabel(TEXT("Exploded Assembly - Hotkey and Progress"));
     OpenModelBuild::RemoveFixedCamera(World);
-    const FString Map=FPackageName::LongPackageNameToFilename(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG"),FPackageName::GetMapPackageExtension());
+    const FString Map=FPackageName::LongPackageNameToFilename(*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG")),FPackageName::GetMapPackageExtension());
     check(FEditorFileUtils::SaveMap(World,Map));
-    UE_LOG(LogTemp,Display,TEXT("OPENMODEL_NOUMG_OK %s Functions=ControlAssembly,UserVariable Input=N"),*BP->GetPathName());
+    UE_LOG(LogTemp,Display,TEXT("OPENMODEL_NOUMG_OK %s Functions=ControlAssembly,UserVariable Input=%s"),*BP->GetPathName(),*OpenModelHotkey().ToString());
     return 0;
 }

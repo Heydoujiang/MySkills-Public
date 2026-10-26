@@ -1,3 +1,4 @@
+#include "OpenModelAssetContext.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "PhysicsEngine/BodySetup.h"
@@ -23,37 +24,82 @@ static int32 EnsureMotionCollision(const FString& Params)
         else if(auto* Body=C->GetBodySetup())Existing|=Body->AggGeom.GetElementCount()>0 || Body->CollisionTraceFlag==CTF_UseComplexAsSimple;
     }
     auto Result=MakeShared<FJsonObject>();Result->SetBoolField(TEXT("existingCollision"),Existing);
-    if(!Existing)
+    bool Added=false,Passed=false;
     {
-        auto* Mesh=Actor->FindComponentByClass<USkeletalMeshComponent>();check(Mesh && Mesh->SkeletalMesh);
+        TArray<USkeletalMeshComponent*> Meshes;Actor->GetComponents(Meshes);check(Meshes.Num());
         auto* Prop=FindFProperty<FObjectProperty>(Actor->GetClass(),TEXT("ExplosionAnimation"));check(Prop);
         auto* Anim=Cast<UAnimSequence>(Prop->GetObjectPropertyValue_InContainer(Actor));check(Anim);
-        Mesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);Mesh->SetAnimation(Anim);Mesh->Stop();
-        auto* Render=Mesh->SkeletalMesh->GetResourceForRendering();check(Render && Render->LODRenderData.Num());
-        auto& LOD=Render->LODRenderData[0];auto* Weights=Mesh->GetSkinWeightBuffer(0);check(Weights);
-        const FTransform ToRoot=Mesh->GetComponentTransform().GetRelativeTransform(Actor->GetRootComponent()->GetComponentTransform());
-        FBox Bounds(ForceInit);const int32 Steps=FMath::Max(1,FMath::CeilToInt(Anim->SequenceLength*SampleRate));
-        for(int32 I=0;I<=Steps;++I)
+        FBox Bounds(ForceInit);uint64 TotalVertices=0;
+        const int32 Steps=FMath::Max(1,FMath::CeilToInt(Anim->SequenceLength*SampleRate));
+        for(auto* Mesh:Meshes)
         {
-            Mesh->SetPosition(Anim->SequenceLength*float(I)/Steps,false);Mesh->TickAnimation(0.f,false);Mesh->RefreshBoneTransforms();
-            TArray<FMatrix> Matrices;Mesh->CacheRefToLocalMatrices(Matrices);TArray<FVector> Positions;
-            USkinnedMeshComponent::ComputeSkinnedPositions(Mesh,Positions,Matrices,LOD,*Weights);
-            check(Positions.Num()>0);for(const auto& V:Positions)Bounds+=ToRoot.TransformPosition(V);
+            check(Mesh->SkeletalMesh);Mesh->SetAnimationMode(EAnimationMode::AnimationSingleNode);Mesh->SetAnimation(Anim);Mesh->Stop();
+            auto* Render=Mesh->SkeletalMesh->GetResourceForRendering();check(Render && Render->LODRenderData.Num());
+            auto& LOD=Render->LODRenderData[0];auto* Weights=Mesh->GetSkinWeightBuffer(0);check(Weights);
+            const FTransform ToRoot=Mesh->GetComponentTransform().GetRelativeTransform(Actor->GetRootComponent()->GetComponentTransform());
+            TArray<FBox> BoneBounds;BoneBounds.Init(FBox(ForceInit),Mesh->GetNumBones());uint32 Checked=0;
+            for(const auto& Section:LOD.RenderSections)for(uint32 V=Section.BaseVertexIndex;V<Section.BaseVertexIndex+Section.NumVertices;++V)
+            {
+                int32 Bone=INDEX_NONE,Count=0;
+                for(uint32 K=0;K<Weights->GetMaxBoneInfluences();++K)if(Weights->GetBoneWeight(V,K))
+                {check(Weights->GetBoneWeight(V,K)==255);Bone=Section.BoneMap[Weights->GetBoneIndex(V,K)];++Count;}
+                check(Count==1 && Bone!=INDEX_NONE);BoneBounds[Bone]+=LOD.StaticVertexBuffers.PositionVertexBuffer.VertexPosition(V);++Checked;
+            }
+            check(Checked==LOD.GetNumVertices());TotalVertices+=Checked;
+            for(int32 I=0;I<=Steps;++I)
+            {
+                Mesh->SetPosition(Anim->SequenceLength*float(I)/Steps,false);Mesh->TickAnimation(0.f,false);Mesh->RefreshBoneTransforms();
+                TArray<FMatrix> Matrices;Mesh->CacheRefToLocalMatrices(Matrices);
+                for(int32 Bone=0;Bone<BoneBounds.Num();++Bone)if(BoneBounds[Bone].IsValid)Bounds+=BoneBounds[Bone].TransformBy(Matrices[Bone]).TransformBy(ToRoot);
+            }
         }
+        Result->SetStringField(TEXT("boundsMethod"),TEXT("All components: all vertices verified one-bone rigid; sampled per-bone bind boxes"));
+        Result->SetNumberField(TEXT("sampleRateHz"),SampleRate);
+        Result->SetNumberField(TEXT("rigidVerticesVerified"),double(TotalVertices));Result->SetNumberField(TEXT("skeletalMeshComponents"),Meshes.Num());
         // Margin handles between-sample motion; curved/fast paths require denser sampling and visual review.
         Bounds=Bounds.ExpandBy(Margin+Bounds.GetExtent().GetMax()*.01f);check(Bounds.IsValid);
-        auto* Node=BP->SimpleConstructionScript->CreateNode(UBoxComponent::StaticClass(),TEXT("AssemblyMotionCollision"));
-        check(BP->SimpleConstructionScript->GetRootNodes().Num()==1);BP->SimpleConstructionScript->GetRootNodes()[0]->AddChildNode(Node);
-        auto* Box=CastChecked<UBoxComponent>(Node->ComponentTemplate);Box->SetBoxExtent(Bounds.GetExtent());Box->SetRelativeLocation(Bounds.GetCenter());Box->SetCollisionProfileName(*Profile);Box->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-        Compile(BP);Save(BP);
+        USCS_Node* OwnedNode=nullptr;
+        for(auto* Node:BP->SimpleConstructionScript->GetAllNodes())if(Node->GetVariableName()==TEXT("AssemblyMotionCollision"))OwnedNode=Node;
+        FName SelectedName=NAME_None;
+        for(auto* C:Components)if(auto* Box=Cast<UBoxComponent>(C))
+        {
+            if(Box->GetCollisionEnabled()==ECollisionEnabled::NoCollision)continue;
+            const FBox Local=Bounds.TransformBy(Actor->GetRootComponent()->GetComponentTransform()).TransformBy(Box->GetComponentTransform().Inverse());
+            const FBox Container(-Box->GetUnscaledBoxExtent(),Box->GetUnscaledBoxExtent());
+            if(Container.IsInsideOrOn(Local.Min) && Container.IsInsideOrOn(Local.Max)){SelectedName=Box->GetFName();break;}
+        }
+        if(OwnedNode || !Existing)
+        {
+            if(!OwnedNode)
+            {
+                OwnedNode=BP->SimpleConstructionScript->CreateNode(UBoxComponent::StaticClass(),TEXT("AssemblyMotionCollision"));
+                check(BP->SimpleConstructionScript->GetRootNodes().Num()==1);BP->SimpleConstructionScript->GetRootNodes()[0]->AddChildNode(OwnedNode);Added=true;
+            }
+            auto* Box=CastChecked<UBoxComponent>(OwnedNode->ComponentTemplate);
+            Box->SetBoxExtent(Bounds.GetExtent());Box->SetRelativeLocation(Bounds.GetCenter());Box->SetCollisionProfileName(*Profile);Box->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+            Compile(BP);Save(BP);SelectedName=OwnedNode->GetVariableName();
+        }
         Result->SetStringField(TEXT("centerRootSpace"),Bounds.GetCenter().ToString());Result->SetStringField(TEXT("extentRootSpace"),Bounds.GetExtent().ToString());Result->SetNumberField(TEXT("samples"),Steps+1);Result->SetStringField(TEXT("profile"),Profile);
-        auto* Probe=World->SpawnActor<AActor>(BP->GeneratedClass);auto* ProbeBox=Probe->FindComponentByClass<UBoxComponent>();check(ProbeBox && ProbeBox->GetCollisionEnabled()!=ECollisionEnabled::NoCollision);
-        check(ProbeBox->GetUnscaledBoxExtent().Equals(Bounds.GetExtent(),.001f));
-        FHitResult Hit;const FVector Center=ProbeBox->GetComponentLocation();const float Distance=Bounds.GetExtent().Size()+100.f;
-        const bool HitBox=World->LineTraceSingleByChannel(Hit,Center+FVector(Distance,0,0),Center-FVector(Distance,0,0),ECC_Visibility);
-        check(HitBox && Hit.GetActor()==Probe);Result->SetBoolField(TEXT("visibilityTracePassed"),true);
+        World->DestroyActor(Actor);
+        auto* Probe=World->SpawnActor<AActor>(BP->GeneratedClass);
+        TArray<UBoxComponent*> Boxes;Probe->GetComponents(Boxes);UBoxComponent* ProbeBox=nullptr;
+        for(auto* Box:Boxes)if(Box->GetFName()==SelectedName)ProbeBox=Box;
+        bool Covers=false,HitBox=false;
+        if(ProbeBox && ProbeBox->GetCollisionEnabled()!=ECollisionEnabled::NoCollision)
+        {
+            const FBox Local=Bounds.TransformBy(Probe->GetRootComponent()->GetComponentTransform()).TransformBy(ProbeBox->GetComponentTransform().Inverse());
+            const FBox Container(-ProbeBox->GetUnscaledBoxExtent()-FVector(.001f),ProbeBox->GetUnscaledBoxExtent()+FVector(.001f));
+            Covers=Container.IsInsideOrOn(Local.Min) && Container.IsInsideOrOn(Local.Max);
+            FHitResult Hit;const FVector Center=ProbeBox->GetComponentLocation();const float Distance=ProbeBox->Bounds.SphereRadius+100.f;
+            HitBox=World->LineTraceSingleByChannel(Hit,Center+FVector(Distance,0,0),Center-FVector(Distance,0,0),ECC_Visibility) && Hit.GetActor()==Probe;
+        }
+        Passed=Covers && HitBox;
+        Result->SetBoolField(TEXT("fullMotionBoundsCovered"),Covers);Result->SetBoolField(TEXT("visibilityTracePassed"),HitBox);
+        if(!Passed)Result->SetStringField(TEXT("diagnostic"),TEXT("Existing collision does not prove full-motion coverage and visibility blocking. Inspect it; preserve user collision and add or adjust a motion box only within the authorized scope."));
     }
-    Result->SetBoolField(TEXT("addedBox"),!Existing);FString Json;FJsonSerializer::Serialize(Result,TJsonWriterFactory<>::Create(&Json));check(FFileHelper::SaveStringToFile(Json,*Report));
-    UE_LOG(LogTemp,Display,TEXT("MOTION_COLLISION_OK added=%d"),!Existing);return 0;
+    Result->SetBoolField(TEXT("addedBox"),Added);Result->SetBoolField(TEXT("passed"),Passed);FString Json;FJsonSerializer::Serialize(Result,TJsonWriterFactory<>::Create(&Json));check(FFileHelper::SaveStringToFile(Json,*Report));
+    if(Passed){UE_LOG(LogTemp,Display,TEXT("MOTION_COLLISION_OK added=%d"),Added);}
+    else {UE_LOG(LogTemp,Error,TEXT("MOTION_COLLISION_REVIEW_REQUIRED %s"),*Path);}
+    return Passed?0:1;
 }
 }

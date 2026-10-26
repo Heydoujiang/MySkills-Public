@@ -1,6 +1,7 @@
 """Reusable rigid-part exploded-view authoring, run with Maya's mayapy.
 
-Commands: inspect, create-config, build, fixture. Source scenes are never saved.
+Commands: inspect, create-config, build, update, export, fixture. Static sources are never saved.
+Build creates the work scene once. Update backs it up and edits that same scene.
 The motion configuration describes presentation layout, not service procedures.
 """
 from __future__ import annotations
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from dcc_workspace import backup_working_scene, sha256
 
 import maya.standalone
 import maya.cmds as cmds
@@ -95,7 +97,7 @@ def inspect_open_scene(source):
                       "materials": sorted(materials)})
     bounds = cmds.exactWorldBoundingBox(shapes)
     return {"schemaVersion": SCHEMA_VERSION, "source": str(Path(source).resolve()),
-            "sourceSha256": hashlib.sha256(Path(source).read_bytes()).hexdigest(),
+            "sourceSha256": sha256(source),
             "linearUnit": "cm", "sourceUpAxis": cmds.upAxis(query=True, axis=True),
             "partCount": len(parts), "meshShapeCount": len(shapes),
             "vertices": sum(p["vertices"] for p in parts),
@@ -109,7 +111,7 @@ def inspect_open_scene(source):
                       "Non-intermediate shapes sharing a transform form one rigid part."]}
 
 
-def make_config(info, name):
+def make_config(info, name, duration_seconds=5.5):
     sizes = info["assemblySizeCm"]
     primary, secondary, thin = sorted(range(3), key=lambda i: sizes[i], reverse=True)
     # Use the largest bounding-volume part as a stationary presentation anchor.
@@ -128,17 +130,17 @@ def make_config(info, name):
                 axis = primary
                 lane = "end"
                 distance = longest * .15
-                start, end = .16, .90
+                start, end = .22, .94
             elif abs(rel[secondary]) > .16:
                 axis = secondary
                 lane = "upper_lower"
                 distance = longest * .17
-                start, end = .10, .84
+                start, end = .12, .83
             else:
                 axis = thin
                 lane = "side"
                 distance = longest * .14
-                start, end = 0., .74
+                start, end = .06, .72
             sign = 1. if rel[axis] >= 0 else -1.
             # Small, repeatable depth bands separate overlapping layers without random scattering.
             rank = min(2, int(abs(rel[axis]) * 6))
@@ -151,12 +153,13 @@ def make_config(info, name):
                       "start": start, "end": end})
     return {"schemaVersion": SCHEMA_VERSION, "assetName": safe_name(name),
             "source": info["source"], "sourceSha256": info["sourceSha256"],
-            "fps": 30, "durationFrames": 90, "linearUnit": "cm",
+            "fps": 30, "durationFrames": round(duration_seconds * 30), "linearUnit": "cm",
             "recenter": True, "uniformScale": 1.0,
-            "easing": "smoothstep", "fbxVersion": "FBX201800",
-            "layoutMethod": "axis_banks_v1",
+            "easing": "beta_3_4", "fbxVersion": "FBX201800",
+            "layoutMethod": "overlapping_axis_banks_v2",
             "notes": ["First-pass visual layout; motion groups are not real-world disassembly steps.",
-                      "Edit per-part offsets, rotations and start/end progress, then rebuild.",
+                      "First-pass timing is a suggestion, not a fixed clip duration or physical assembly order.",
+                      "Edit offsets, optional pathOffsetsCm, rotations and overlapping start/end progress; use update after first build.",
                       "0 is assembled; 1 is exploded. This asset contains no return or camera animation.",
                       "Offsets are centimeters in the original Maya scene axes after recentering/scaling."],
             "parts": parts}
@@ -167,8 +170,8 @@ def validate_config(config, info):
         raise ValueError("Unsupported motion config schemaVersion")
     if config.get("fps") != 30 or config.get("durationFrames", 0) <= 0:
         raise ValueError("This pipeline requires fps=30 and a positive durationFrames")
-    if config.get("linearUnit") != "cm" or config.get("easing") != "smoothstep":
-        raise ValueError("Expected centimeters and smoothstep easing")
+    if config.get("linearUnit") != "cm" or config.get("easing") not in ("smoothstep", "smootherstep", "beta_3_4"):
+        raise ValueError("Expected centimeters and smoothstep, smootherstep or beta_3_4 easing")
     if not (math.isfinite(config.get("uniformScale", 0)) and config["uniformScale"] > 0):
         raise ValueError("uniformScale must be positive and finite")
     source_parts = {p["partId"]: p for p in info["parts"]}
@@ -187,11 +190,58 @@ def validate_config(config, info):
         for key in ("offsetCm", "rotationDegrees"):
             if len(part[key]) != 3 or not all(math.isfinite(v) for v in part[key]):
                 raise ValueError(key + " must contain three finite values")
+        if "pathOffsetsCm" in part:
+            points = part["pathOffsetsCm"]
+            if len(points) < 2 or any(len(p) != 3 or not all(math.isfinite(v) for v in p) for p in points):
+                raise ValueError("pathOffsetsCm needs at least two finite xyz points")
+            if points[0] != [0, 0, 0] or points[-1] != part["offsetCm"]:
+                raise ValueError("pathOffsetsCm must start at zero and finish at offsetCm")
 
 
-def ease(progress, start, end):
+def ease(progress, start, end, model="beta_3_4"):
     t = max(0., min(1., (progress - start) / (end - start)))
-    return t * t * (3. - 2. * t)
+    if model == "smoothstep":
+        return t * t * (3. - 2. * t)
+    if model == "smootherstep":
+        return t ** 3 * (10. - 15. * t + 6. * t * t)
+    # The tested beta(3,4) CDF: zero speed/acceleration at both endpoints,
+    # with a longer settling tail. Cohorts overlap instead of adding a hard pause.
+    return 20. * t ** 3 - 45. * t ** 4 + 36. * t ** 5 - 10. * t ** 6
+
+
+def path_offset(motion, amount):
+    points = motion.get("pathOffsetsCm", [[0., 0., 0.], motion["offsetCm"]])
+    lengths = [math.dist(a, b) for a, b in zip(points, points[1:])]
+    total = sum(lengths)
+    if total <= 1e-12:
+        return list(points[-1])
+    target = min(1., max(0., amount)) * total
+    traversed = 0.
+    for a, b, length in zip(points, points[1:], lengths):
+        if length and target <= traversed + length:
+            t = (target - traversed) / length
+            return [a[i] + (b[i] - a[i]) * t for i in range(3)]
+        traversed += length
+    return list(points[-1])
+
+
+def key_records(records, config, root="root"):
+    for rec in records:
+        cmds.cutKey(rec["bone"], attribute=("tx", "ty", "tz", "rx", "ry", "rz"), clear=True)
+    for frame in range(config["durationFrames"] + 1):
+        for rec in records:
+            motion = rec["motion"]
+            amount = ease(frame / config["durationFrames"], motion["start"], motion["end"], config["easing"])
+            offset = path_offset(motion, amount)
+            values = [rec["pivot"][i] + offset[i] for i in range(3)] + [v * amount for v in motion["rotationDegrees"]]
+            for attr, value in zip(("tx", "ty", "tz", "rx", "ry", "rz"), values):
+                cmds.setKeyframe(rec["bone"], attribute=attr, time=frame, value=value,
+                                inTangentType="linear", outTangentType="linear")
+    cmds.cutKey(root, attribute=("tx", "ty", "tz", "rx", "ry", "rz"), clear=True)
+    for frame in (0, config["durationFrames"]):
+        for attr in ("tx", "ty", "tz", "rx", "ry", "rz"):
+            cmds.setKeyframe(root, attribute=attr, time=frame, value=0,
+                            inTangentType="linear", outTangentType="linear")
 
 
 def matrix_of(node):
@@ -255,6 +305,8 @@ def build(config_path, output):
     if any(str(p.resolve()).casefold() == str(Path(source).resolve()).casefold()
            for p in destinations):
         raise ValueError("Output would overwrite the source model; choose another directory/name")
+    if destinations[0].exists():
+        raise FileExistsError("Work scene already exists; use update --scene: " + str(destinations[0]))
     out.mkdir(parents=True, exist_ok=True)
     write_json(out / "inspection.json", info)
     write_json(out / "motion_config.json", config)
@@ -327,21 +379,7 @@ def build(config_path, output):
         cmds.skinPercent(skin, rec["mesh"], transformValue=[(bone, 1.0)])
         rec["skin"] = skin
         rec["restMatrix"] = matrix_of(bone)
-    for frame in range(config["durationFrames"] + 1):
-        progress = frame / config["durationFrames"]
-        for rec in records:
-            motion = rec["motion"]
-            amount = ease(progress, motion["start"], motion["end"])
-            translation = [rec["pivot"][i] + motion["offsetCm"][i] * amount for i in range(3)]
-            rotation = [v * amount for v in motion["rotationDegrees"]]
-            for attr, value in zip(("tx", "ty", "tz", "rx", "ry", "rz"), translation + rotation):
-                cmds.setKeyframe(rec["bone"], attribute=attr, time=frame, value=value,
-                                 inTangentType="linear", outTangentType="linear")
-    # Root animation track keeps the exported clip span explicit even for a static fixture.
-    for frame in (0, config["durationFrames"]):
-        for attr in ("tx", "ty", "tz", "rx", "ry", "rz"):
-            cmds.setKeyframe(root, attribute=attr, time=frame, value=0,
-                             inTangentType="linear", outTangentType="linear")
+    key_records(records, config, root)
     checks = []
     sample_progress = sorted(set([i / 10 for i in range(11)] + [.037, .283, .619, .947]))
     max_rigid_error = 0.
@@ -378,6 +416,7 @@ def build(config_path, output):
     cmds.file(rename=str(out / (name + "_Animated.mb")))
     cmds.file(save=True, type="mayaBinary", force=True)
     validation = {"schemaVersion": SCHEMA_VERSION, "assetName": name,
+                  "authoringRig": "open_model_rigid_v2", "appliedConfig": config,
                   "fps": config["fps"], "durationFrames": config["durationFrames"],
                   "durationSeconds": config["durationFrames"] / config["fps"],
                   "coordinateConvention": {
@@ -403,6 +442,107 @@ def build(config_path, output):
     print("BUILD_RESULT", json.dumps({"output": str(out), "parts": len(records),
                                        "bones": len(records) + 1, "validationPassed": True,
                                        "maxRigidVertexErrorCm": max_rigid_error}))
+
+
+def update(config_path, scene, output):
+    """Revise a pipeline-created rig without replacing meshes, materials or camera."""
+    scene = Path(scene).resolve(strict=True)
+    out = Path(output).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+    base = scene.parent
+    inspection = json.loads((base / "inspection.json").read_text(encoding="utf-8-sig"))
+    previous = json.loads((base / "validation_samples.json").read_text(encoding="utf-8-sig"))
+    if any("restTranslationCm" not in p for p in previous.get("parts", [])):
+        raise ValueError("This is not a pipeline-created rigid rig. Adapt its transform-animation tracks explicitly; do not rebuild from the static source")
+    if "appliedConfig" not in previous:
+        raise ValueError("Legacy rig lacks its applied config snapshot. Verify and add the previous matching config to validation_samples.json before updating")
+    if sha256(inspection["source"]) != inspection["sourceSha256"]:
+        raise ValueError("Static source changed; explicitly remap parts before updating")
+    if scene == Path(inspection["source"]).resolve():
+        raise ValueError("The static source cannot be the working animation scene")
+    validate_config(config, inspection)
+    if previous["assetName"] != config["assetName"]:
+        raise ValueError("Asset identity changed; do not overwrite an unrelated working scene")
+    if previous["sourceToModel"] != {"subtractCenterCm": inspection["assemblyCenterCm"] if config["recenter"] else [0., 0., 0.], "uniformScale": config["uniformScale"]}:
+        raise ValueError("An update cannot change source-to-model scale/recentering; explicitly revise geometry separately")
+    backup = backup_working_scene(scene, [base / "motion_config.json", base / "inspection.json", base / "validation_samples.json"])
+    open_geometry(scene)
+    cmds.currentUnit(time="ntsc")
+    cmds.currentTime(0, update=True)
+    records = []
+    by_id = {p["partId"]: p for p in previous["parts"]}
+    for motion in config["parts"]:
+        old = by_id[motion["partId"]]
+        bone, mesh = old["boneName"], old["meshName"]
+        if not cmds.objExists(bone) or not cmds.objExists(mesh):
+            raise ValueError("Working scene no longer matches recorded rig: " + bone)
+        current = matrix_data(bone)
+        if any(abs(current["translationCm"][i] - old["restTranslationCm"][i]) > 1e-5 for i in range(3)) or any(abs(v) > 1e-7 for v in current["rotationXyzw"][:3]) or any(abs(v - 1.) > 1e-7 for v in current["scale"]):
+            raise ValueError("Recorded assembled bone pose changed; resolve it explicitly before updating: " + bone)
+        shapes = cmds.listRelatives(mesh, shapes=True, fullPath=True, noIntermediate=True) or []
+        records.append({"bone": bone, "mesh": mesh, "pivot": old["restTranslationCm"], "motion": motion,
+                        "restMatrix": matrix_of(bone), "samples": [(shape, vertex_samples(shape)) for shape in shapes]})
+    key_records(records, config)
+    cmds.playbackOptions(minTime=0, maxTime=config["durationFrames"], animationStartTime=0, animationEndTime=config["durationFrames"])
+    samples, max_error = [], 0.
+    for progress in sorted(set([i / 10 for i in range(11)] + [.037, .283, .619, .947])):
+        frame = progress * config["durationFrames"]
+        cmds.currentTime(frame, update=True)
+        bones = {"root": matrix_data("root")}
+        error = 0.
+        for rec in records:
+            bones[rec["bone"]] = matrix_data(rec["bone"])
+            delta = rec["restMatrix"].inverse() * matrix_of(rec["bone"])
+            for shape, points in rec["samples"]:
+                fn = mesh_function(shape)
+                for index, rest in points:
+                    error = max(error, (fn.getPoint(index, om.MSpace.kWorld) - rest * delta).length())
+        max_error = max(max_error, error)
+        samples.append({"progress": progress, "frame": frame, "bones": bones, "maxRigidVertexErrorCm": error})
+    if max_error > .002:
+        raise RuntimeError("Rigid update check failed; work file has not been saved")
+    previous.update(durationFrames=config["durationFrames"], durationSeconds=config["durationFrames"] / 30,
+                    samples=samples, maxRigidVertexErrorCm=max_error, backup=str(backup), appliedConfig=config)
+    for part in previous["parts"]:
+        part["motionGroup"] = next(m["motionGroup"] for m in config["parts"] if m["partId"] == part["partId"])
+    cmds.currentTime(0, update=True)
+    # Saving the same path keeps camera, material and scene references stable.
+    cmds.file(save=True, force=True, type="mayaAscii" if scene.suffix.lower() == ".ma" else "mayaBinary")
+    write_json(base / "motion_config.json", config)
+    write_json(base / "validation_samples.json", previous)
+    if out != base:
+        write_json(out / "validation_samples.json", previous)
+    result = {"workingScene": str(scene), "sceneSha256": sha256(scene), "backup": str(backup),
+              "maxRigidVertexErrorCm": max_error, "animationApprovalRequired": True}
+    write_json(out / "update_manifest.json", result)
+    print("UPDATE_RESULT", json.dumps(result))
+
+
+def export_working_rig(config_path, scene, output):
+    """Export the saved/approved working rig without rebuilding or saving it."""
+    config = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
+    scene = Path(scene).resolve(strict=True)
+    validation = json.loads((scene.parent / "validation_samples.json").read_text(encoding="utf-8-sig"))
+    if validation.get("appliedConfig") != config:
+        raise ValueError("Config differs from the saved rig snapshot; update and obtain preview approval first")
+    before = sha256(scene)
+    out = Path(output).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    destination = out / (config["assetName"] + ".fbx")
+    if destination.exists():
+        raise FileExistsError("Back up the previous export before replacement: " + str(destination))
+    open_geometry(scene)
+    cmds.currentTime(0, update=True)
+    meshes = [p["meshName"] for p in validation["parts"]]
+    export_fbx(destination, meshes, "root", config["durationFrames"], config["fbxVersion"])
+    if sha256(scene) != before:
+        raise RuntimeError("Working scene unexpectedly changed during export")
+    write_json(out / "validation_samples.json", validation)
+    result = {"fbx": str(destination), "fbxSha256": sha256(destination), "sceneSha256": before,
+              "sourceSceneUnchanged": True, "durationSeconds": config["durationFrames"] / 30}
+    write_json(out / "export_manifest.json", result)
+    print("EXPORT_RESULT", json.dumps(result))
 
 
 def create_fixture(path):
@@ -453,9 +593,18 @@ def main():
     config_cmd.add_argument("source")
     config_cmd.add_argument("--output", required=True)
     config_cmd.add_argument("--name", required=True)
+    config_cmd.add_argument("--duration-seconds", type=float, default=5.5)
     build_cmd = sub.add_parser("build")
     build_cmd.add_argument("config")
     build_cmd.add_argument("--output", required=True)
+    update_cmd = sub.add_parser("update")
+    update_cmd.add_argument("config")
+    update_cmd.add_argument("--scene", required=True)
+    update_cmd.add_argument("--output", required=True)
+    export_cmd = sub.add_parser("export")
+    export_cmd.add_argument("config")
+    export_cmd.add_argument("--scene", required=True)
+    export_cmd.add_argument("--output", required=True)
     fixture_cmd = sub.add_parser("fixture")
     fixture_cmd.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -465,10 +614,16 @@ def main():
             create_fixture(args.output)
         elif args.command == "build":
             build(args.config, args.output)
+        elif args.command == "update":
+            update(args.config, args.scene, args.output)
+        elif args.command == "export":
+            export_working_rig(args.config, args.scene, args.output)
         else:
             open_geometry(args.source)
             info = inspect_open_scene(args.source)
-            write_json(args.output, info if args.command == "inspect" else make_config(info, args.name))
+            if args.command == "create-config" and (not math.isfinite(args.duration_seconds) or args.duration_seconds <= 0):
+                raise ValueError("duration-seconds must be positive and finite")
+            write_json(args.output, info if args.command == "inspect" else make_config(info, args.name, args.duration_seconds))
             print("INSPECTION_RESULT", json.dumps({k: info[k] for k in
                   ("partCount", "meshShapeCount", "vertices", "triangles", "boundsCm")}))
     finally:

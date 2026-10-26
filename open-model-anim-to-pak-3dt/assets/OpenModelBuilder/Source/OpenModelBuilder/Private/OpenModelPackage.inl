@@ -1,3 +1,4 @@
+#include "OpenModelAssetContext.h"
 #include "AssetRegistryModule.h"
 #include "IAssetRegistry.h"
 #include "DesktopPlatformModule.h"
@@ -14,7 +15,7 @@ static int32 PreparePackage(const FString& Params)
     FParse::Value(*Params,TEXT("CustomRoot="),CustomRoot);
     FParse::Value(*Params,TEXT("TargetProject="),TargetProject);
     check(!Destination.IsEmpty() && FPaths::DirectoryExists(Destination));
-    auto* BP=LoadObject<UBlueprint>(nullptr,TEXT("/Game/OpenModel/NoUMG/BP_ExplodedAssembly_NoUMG.BP_ExplodedAssembly_NoUMG"));check(BP);
+    auto* BP=LoadObject<UBlueprint>(nullptr,*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/BP_ExplodedAssembly_NoUMG.BP_ExplodedAssembly_NoUMG")));check(BP);
     UEdGraph* Graph=nullptr; UK2Node_FunctionEntry* Entry=nullptr;
     for(auto* G:BP->FunctionGraphs)if(G->GetFName()==TEXT("ControlAssembly"))Graph=G;
     check(Graph);for(auto* Node:Graph->Nodes)if(auto* E=Cast<UK2Node_FunctionEntry>(Node))Entry=E;check(Entry);
@@ -41,7 +42,7 @@ static int32 PreparePackage(const FString& Params)
     }
     Manifest->SetArrayField(TEXT("userVariableSetterOrder"),Inputs);
     Manifest->SetBoolField(TEXT("blueprintUnmodified"),true);
-    FString MapName=TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_FreeView");
+    FString MapName=*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_FreeView"));
     FParse::Value(*Params,TEXT("Map="),MapName);
     check(FEditorFileUtils::LoadMap(MapName,false,true));auto* World=GEditor->GetEditorWorldContext().World();
     TArray<AActor*> Remove;AActor* Assembly=nullptr;

@@ -1,3 +1,4 @@
+# FALLBACK ONLY: prefer native_playblast.py in the authoring DCC. Use offline rendering only when native capture is unavailable or explicitly requested.
 """Render Maya's exported skeletal animation to an MP4 using Blender.
 
 blender --background --factory-startup --python render_animation_preview.py -- OUTPUT_DIR ASSET

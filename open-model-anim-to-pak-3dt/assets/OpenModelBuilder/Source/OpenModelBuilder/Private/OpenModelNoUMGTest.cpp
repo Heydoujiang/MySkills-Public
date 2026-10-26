@@ -1,3 +1,4 @@
+#include "OpenModelAssetContext.h"
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
 #include "Tests/AutomationEditorCommon.h"
@@ -11,6 +12,10 @@
 #include "PropertyHandle.h"
 #include "Misc/Paths.h"
 #include "UnrealClient.h"
+#include "Engine/Blueprint.h"
+#include "Engine/GameViewportClient.h"
+#include "ImageUtils.h"
+#include "Misc/FileHelper.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 class FNoUMGInteraction : public IAutomationLatentCommand
@@ -20,9 +25,18 @@ class FNoUMGInteraction : public IAutomationLatentCommand
     TSharedPtr<ISinglePropertyView> PropertyView;
     float P(){return FindFProperty<FFloatProperty>(Actor->GetClass(),TEXT("Progress"))->GetPropertyValue_InContainer(Actor.Get());}
     bool Auto(){return FindFProperty<FBoolProperty>(Actor->GetClass(),TEXT("bAutoPlaying"))->GetPropertyValue_InContainer(Actor.Get());}
-    void Key(EInputEvent Event){PC->InputKey(EKeys::N,Event,Event==IE_Pressed?1.f:0.f,false);}
+    void Key(EInputEvent Event){PC->InputKey(OpenModelHotkey(),Event,Event==IE_Pressed?1.f:0.f,false);}
     void Edit(float Value){Test->TestTrue(TEXT("Details property handle accepts value"),PropertyView->GetPropertyHandle()->SetValue(Value)==FPropertyAccess::Success);}
-    void Shot(const TCHAR* Name){FString Dir;FParse::Value(FCommandLine::Get(),TEXT("NoUMGReport="),Dir);if(!Dir.IsEmpty())FScreenshotRequest::RequestScreenshot(Dir/Name,true,false);}
+    void Shot(const TCHAR* Name)
+    {
+        FString Dir;FParse::Value(FCommandLine::Get(),TEXT("NoUMGReport="),Dir);if(Dir.IsEmpty())return;
+        auto* Client=GEditor->PlayWorld?GEditor->PlayWorld->GetGameViewport():nullptr;
+        auto* Viewport=Client?Client->Viewport:nullptr;TArray<FColor> Pixels;
+        if(!Viewport || !GetViewportScreenShot(Viewport,Pixels))return;
+        const FIntPoint Size=Viewport->GetSizeXY();TArray<uint8> Png;
+        FImageUtils::CompressImageArray(Size.X,Size.Y,Pixels,Png);
+        FFileHelper::SaveArrayToFile(Png,*(Dir/Name));
+    }
 public:
     explicit FNoUMGInteraction(FAutomationTestBase* T):Test(T){}
     virtual bool Update() override
@@ -32,7 +46,13 @@ public:
         auto* World=GEditor->PlayWorld;if(!World)return false;
         if(Stage==0)
         {
-            for(TActorIterator<AActor> It(World);It;++It)if(It->GetClass()->GetName()==TEXT("BP_ExplodedAssembly_NoUMG_C"))Actor=*It;
+            FString Blueprint=OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/BP_ExplodedAssembly_NoUMG.BP_ExplodedAssembly_NoUMG"));
+            FParse::Value(FCommandLine::Get(),TEXT("Blueprint="),Blueprint);
+            auto* Expected=LoadObject<UBlueprint>(nullptr,*Blueprint);
+            if(!Expected || !Expected->GeneratedClass){Test->AddError(TEXT("PIE target Blueprint cannot be loaded: ")+Blueprint);return true;}
+            int32 MatchingActors=0;
+            for(TActorIterator<AActor> It(World);It;++It)if(It->GetClass()==Expected->GeneratedClass){Actor=*It;++MatchingActors;}
+            if(MatchingActors>1){Test->AddError(TEXT("PIE test requires exactly one instance of the selected Blueprint"));return true;}
             PC=World->GetFirstPlayerController();if(!Actor.IsValid()||!PC.IsValid()||!Actor->InputComponent)return false;
             PropertyView=FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor")).CreateSingleProperty(Actor.Get(),TEXT("Progress"),FSinglePropertyParams());
             if(!PropertyView.IsValid()||!PropertyView->GetPropertyHandle().IsValid()){Test->AddError(TEXT("No runtime Progress property editor"));return true;}
@@ -45,14 +65,14 @@ public:
         switch(Stage)
         {
         case 1: Shot(TEXT("assembled.png"));Key(IE_Pressed);Stage=2;break;
-        case 2: Key(IE_Released);Test->TestTrue(TEXT("N starts outward on actual world ticks"),P()>.01f&&Auto());Before=P();Stage=3;break;
+        case 2: Key(IE_Released);Test->TestTrue(TEXT("Configured key starts outward on actual world ticks"),P()>.01f&&Auto());Before=P();Stage=3;break;
         case 3: Key(IE_Pressed);Before=P();Stage=4;break;
-        case 4: Key(IE_Released);Test->TestTrue(TEXT("Second N reverses from current progress"),P()<Before);Edit(.5f);Stage=5;break;
+        case 4: Key(IE_Released);Test->TestTrue(TEXT("Second key press reverses from current progress"),P()<Before);Edit(.5f);Stage=5;break;
         case 5: Test->TestTrue(TEXT("Live Details edit takes over and holds"),FMath::IsNearlyEqual(P(),.5f,1.e-5f)&&!Auto());Shot(TEXT("half.png"));Edit(1.f);Stage=6;break;
         case 6: Test->TestTrue(TEXT("Details reaches exact exploded end"),P()==1.f&&!Auto());Shot(TEXT("exploded.png"));Key(IE_Pressed);Stage=7;break;
-        case 7: Key(IE_Released);Test->TestTrue(TEXT("N assembles from full end"),P()<1.f&&Auto());Edit(.283f);Stage=8;break;
+        case 7: Key(IE_Released);Test->TestTrue(TEXT("Configured key assembles from full end"),P()<1.f&&Auto());Edit(.283f);Stage=8;break;
         case 8: Test->TestTrue(TEXT("Arbitrary Details progress"),FMath::IsNearlyEqual(P(),.283f,1.e-5f)&&!Auto());Key(IE_Pressed);Stage=9;break;
-        case 9: Key(IE_Released);Test->TestTrue(TEXT("N from manual middle resumes outward"),P()>.283f&&Auto());Edit(0.f);Stage=10;break;
+        case 9: Key(IE_Released);Test->TestTrue(TEXT("Configured key from manual middle resumes outward"),P()>.283f&&Auto());Edit(0.f);Stage=10;break;
         case 10: Test->TestTrue(TEXT("Details restores assembled end"),P()==0.f&&!Auto());return true;
         }
         Last=Now;return false;
@@ -61,7 +81,9 @@ public:
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FOpenModelNoUMGPIE,"OpenModel.NoUMG.PIE",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
 bool FOpenModelNoUMGPIE::RunTest(const FString& Parameters)
 {
-    ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG")));
+    FString Map=OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/Demo_ExplodedAssembly_NoUMG"));
+    FParse::Value(FCommandLine::Get(),TEXT("Map="),Map);
+    ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(Map));
     ADD_LATENT_AUTOMATION_COMMAND(FWaitForShadersToFinishCompiling());
     ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
     FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShareable(new FNoUMGInteraction(this)));

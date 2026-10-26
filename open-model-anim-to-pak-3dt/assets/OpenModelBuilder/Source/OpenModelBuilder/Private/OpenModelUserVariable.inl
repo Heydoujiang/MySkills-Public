@@ -1,8 +1,9 @@
+#include "OpenModelAssetContext.h"
 namespace OpenModelBuild
 {
 static int32 SplitUserVariable()
 {
-    auto* BP=LoadObject<UBlueprint>(nullptr,TEXT("/Game/OpenModel/NoUMG/BP_ExplodedAssembly_NoUMG.BP_ExplodedAssembly_NoUMG"));check(BP);
+    auto* BP=LoadObject<UBlueprint>(nullptr,*OpenModelLiteral(TEXT("/Game/OpenModel/NoUMG/BP_ExplodedAssembly_NoUMG.BP_ExplodedAssembly_NoUMG")));check(BP);
     UEdGraph* G=nullptr;UK2Node_FunctionEntry* Entry=nullptr;
     for(auto* Graph:BP->FunctionGraphs){check(Graph->GetFName()!=TEXT("UserVariable"));if(Graph->GetFName()==TEXT("ControlAssembly"))G=Graph;}
     check(G);for(auto* N:G->Nodes)if(auto* E=Cast<UK2Node_FunctionEntry>(N))Entry=E;check(Entry);
